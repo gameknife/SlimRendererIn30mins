@@ -2,6 +2,14 @@
 
 namespace SlimRender {
 
+namespace {
+constexpr float kMoveSpeed = 5.0f;        // world units per second
+constexpr float kMouseSensitivity = 0.15f; // degrees per pixel
+constexpr float kFastMultiplier = 3.0f;
+constexpr float kSlowMultiplier = 0.3f;
+constexpr float kPitchLimit = 89.0f;      // stop short of the poles to keep `up` stable
+} // namespace
+
 Camera::Camera() {
     UpdateVectors();
 }
@@ -15,74 +23,52 @@ void Camera::SetPosition(const glm::vec3& position) {
 void Camera::SetTarget(const glm::vec3& target) {
     target_ = target;
     glm::vec3 dir = glm::normalize(target_ - position_);
-    pitch_ = glm::degrees(asin(std::clamp(dir.y, -0.999f, 0.999f)));
-    yaw_ = glm::degrees(atan2(dir.z, dir.x));
+    pitch_ = glm::degrees(std::asin(std::clamp(dir.y, -0.999f, 0.999f)));
+    yaw_ = glm::degrees(std::atan2(dir.z, dir.x));
     hasMoved_ = true;
     UpdateVectors();
 }
 
-void Camera::SetPerspective(float fovYDegrees, float nearZ, float farZ) {
-    fovY_ = fovYDegrees;
-    nearZ_ = nearZ;
-    farZ_ = farZ;
-    hasMoved_ = true;
-}
-
 void Camera::UpdateVectors() {
-    glm::vec3 front;
-    front.x = cos(glm::radians(yaw_)) * cos(glm::radians(pitch_));
-    front.y = sin(glm::radians(pitch_));
-    front.z = sin(glm::radians(yaw_)) * cos(glm::radians(pitch_));
-    forward_ = glm::normalize(front);
+    forward_ = glm::normalize(glm::vec3(
+        std::cos(glm::radians(yaw_)) * std::cos(glm::radians(pitch_)),
+        std::sin(glm::radians(pitch_)),
+        std::sin(glm::radians(yaw_)) * std::cos(glm::radians(pitch_))));
     right_ = glm::normalize(glm::cross(forward_, glm::vec3(0.0f, 1.0f, 0.0f)));
     up_ = glm::normalize(glm::cross(right_, forward_));
 }
 
-void Camera::Update(float dt, Window& window) {
+void Camera::Update(float dt, const Window& window) {
     if (window.IsInputCaptured()) {
-        return;
+        return; // the cursor is over a panel or dragging a gizmo
     }
 
-    float dx = 0.0f, dy = 0.0f;
-    window.GetMouseDelta(dx, dy);
-    float wheel = window.GetMouseWheelDelta();
+    const glm::vec2 mouse = window.GetMouseDelta();
+    const bool mouseMoved = glm::length2(mouse) > 1e-6f;
+    const bool rotating = window.IsMouseButtonDown(1) && !window.IsKeyDown(VK_SHIFT);
+    const bool panning = window.IsMouseButtonDown(2) ||
+                         (window.IsMouseButtonDown(1) && window.IsKeyDown(VK_SHIFT));
 
-    // Right mouse button to rotate
-    if (window.IsMouseButtonDown(1)) {
-        if (std::abs(dx) > 0.001f || std::abs(dy) > 0.001f) {
-            yaw_ += dx * mouseSensitivity_;
-            pitch_ -= dy * mouseSensitivity_;
-            pitch_ = std::clamp(pitch_, -89.0f, 89.0f);
-            UpdateVectors();
-            hasMoved_ = true;
-        }
-    }
-
-    // Middle mouse button or Shift+Right to pan
-    if (window.IsMouseButtonDown(2) || (window.IsMouseButtonDown(1) && window.IsKeyDown(VK_SHIFT))) {
-        if (std::abs(dx) > 0.001f || std::abs(dy) > 0.001f) {
-            float panSpeed = 0.005f * glm::length(position_ - target_);
-            position_ -= right_ * (dx * panSpeed);
-            position_ += up_ * (dy * panSpeed);
-            target_ -= right_ * (dx * panSpeed);
-            target_ += up_ * (dy * panSpeed);
-            hasMoved_ = true;
-        }
-    }
-
-    // Mouse wheel zoom
-    if (std::abs(wheel) > 0.001f) {
-        position_ += forward_ * (wheel * 0.5f);
+    if (rotating && mouseMoved) {
+        yaw_ += mouse.x * kMouseSensitivity;
+        pitch_ = std::clamp(pitch_ - mouse.y * kMouseSensitivity, -kPitchLimit, kPitchLimit);
+        UpdateVectors();
         hasMoved_ = true;
     }
 
-    // WASD keyboard movement
-    float currentSpeed = moveSpeed_;
-    if (window.IsKeyDown(VK_SHIFT)) {
-        currentSpeed *= 3.0f;
+    if (panning && mouseMoved) {
+        // Scale panning with the viewing distance so it feels the same at any zoom level.
+        const float panSpeed = 0.005f * glm::length(position_ - target_);
+        const glm::vec3 offset = up_ * (mouse.y * panSpeed) - right_ * (mouse.x * panSpeed);
+        position_ += offset;
+        target_ += offset;
+        hasMoved_ = true;
     }
-    if (window.IsKeyDown(VK_CONTROL)) {
-        currentSpeed *= 0.3f;
+
+    const float wheel = window.GetMouseWheelDelta();
+    if (std::abs(wheel) > 0.001f) {
+        position_ += forward_ * (wheel * 0.5f);
+        hasMoved_ = true;
     }
 
     glm::vec3 moveDir(0.0f);
@@ -93,8 +79,11 @@ void Camera::Update(float dt, Window& window) {
     if (window.IsKeyDown('E')) moveDir += glm::vec3(0.0f, 1.0f, 0.0f);
     if (window.IsKeyDown('Q')) moveDir -= glm::vec3(0.0f, 1.0f, 0.0f);
 
-    if (glm::length2(moveDir) > 0.0001f) {
-        position_ += glm::normalize(moveDir) * (currentSpeed * dt);
+    if (glm::length2(moveDir) > 0.0f) {
+        float speed = kMoveSpeed;
+        if (window.IsKeyDown(VK_SHIFT)) speed *= kFastMultiplier;
+        if (window.IsKeyDown(VK_CONTROL)) speed *= kSlowMultiplier;
+        position_ += glm::normalize(moveDir) * (speed * dt);
         hasMoved_ = true;
     }
 }
@@ -104,27 +93,21 @@ glm::mat4 Camera::GetViewMatrix() const {
 }
 
 glm::mat4 Camera::GetProjectionMatrix(float aspect) const {
-    glm::mat4 proj = glm::perspective(glm::radians(fovY_), aspect, nearZ_, farZ_);
-    proj[1][1] *= -1.0f; // Vulkan Y-flip
+    glm::mat4 proj = GetGizmoProjectionMatrix(aspect);
+    proj[1][1] *= -1.0f;
     return proj;
 }
 
-glm::mat4 Camera::GetStandardProjectionMatrix(float aspect) const {
+glm::mat4 Camera::GetGizmoProjectionMatrix(float aspect) const {
     return glm::perspective(glm::radians(fovY_), aspect, nearZ_, farZ_);
 }
 
-glm::mat4 Camera::GetInvViewMatrix() const {
-    return glm::inverse(GetViewMatrix());
-}
-
-glm::mat4 Camera::GetInvProjectionMatrix(float aspect) const {
-    return glm::inverse(GetProjectionMatrix(aspect));
-}
-
 CameraUBO Camera::GetUBO(float aspect) const {
+    // The shader turns pixel coordinates into a world-space ray, so it needs the
+    // inverses rather than the forward matrices.
     CameraUBO ubo{};
-    ubo.invView = GetInvViewMatrix();
-    ubo.invProj = GetInvProjectionMatrix(aspect);
+    ubo.invView = glm::inverse(GetViewMatrix());
+    ubo.invProj = glm::inverse(GetProjectionMatrix(aspect));
     ubo.cameraPos = glm::vec4(position_, 1.0f);
     return ubo;
 }

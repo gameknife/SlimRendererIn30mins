@@ -28,6 +28,9 @@ CMakeUserPresets.json
 # ImGui temporary configuration
 imgui.ini
 
+# Compiled shaders (generated into the build output directory)
+assets/shaders/*.spv
+
 # Output renders and test artifacts
 renders/
 test_*.png

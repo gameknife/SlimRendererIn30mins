@@ -20,20 +20,20 @@ public:
     HWND GetHWND() const { return hwnd_; }
     HINSTANCE GetHINSTANCE() const { return hinstance_; }
 
-    // Input state
+    // Input state, sampled once per frame by PollEvents()
     bool IsKeyDown(int vkey) const;
     bool IsMouseButtonDown(int button) const; // 0 = left, 1 = right, 2 = middle
-    void GetMouseDelta(float& dx, float& dy);
-    float GetMouseWheelDelta();
+    glm::vec2 GetMouseDelta() const { return { mouseDeltaX_, mouseDeltaY_ }; }
+    float GetMouseWheelDelta() const { return mouseWheelDelta_; }
 
     void SetInputCaptured(bool captured) { inputCaptured_ = captured; }
     bool IsInputCaptured() const { return inputCaptured_; }
 
-    // Drag and drop file support
+    // Drag and drop: returns the dropped path once, then forgets it
     bool HasDroppedFile() const { return hasDroppedFile_; }
-    std::string GetDroppedFile() {
+    std::string TakeDroppedFile() {
         hasDroppedFile_ = false;
-        return droppedFile_;
+        return std::move(droppedFile_);
     }
 
 private:

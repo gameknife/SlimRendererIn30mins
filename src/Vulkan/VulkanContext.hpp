@@ -5,10 +5,16 @@
 
 namespace SlimRender {
 
+// Owns the Vulkan instance, the ray-query capable device and the one queue everything
+// runs on. A single graphics+compute+present queue keeps submission logic trivial; a
+// production renderer would use dedicated transfer and async-compute queues.
 class VulkanContext {
 public:
-    VulkanContext(const Window& window);
+    explicit VulkanContext(const Window& window);
     ~VulkanContext();
+
+    VulkanContext(const VulkanContext&) = delete;
+    VulkanContext& operator=(const VulkanContext&) = delete;
 
     VkInstance GetInstance() const { return instance_; }
     VkPhysicalDevice GetPhysicalDevice() const { return physicalDevice_; }
@@ -20,10 +26,13 @@ public:
 
     uint32_t FindMemoryType(uint32_t typeFilter, VkMemoryPropertyFlags properties) const;
 
+    // Records, submits and waits for a one-shot command buffer. Simple but fully
+    // synchronous, so it belongs in load/setup paths only, never in the frame loop.
     VkCommandBuffer BeginSingleTimeCommands() const;
     void EndSingleTimeCommands(VkCommandBuffer commandBuffer) const;
 
-    // Ray tracing extension function pointers (dynamically loaded via vkGetDeviceProcAddr)
+    // Acceleration structure entry points live in an extension, so they are not exported
+    // by the loader and have to be resolved through vkGetDeviceProcAddr.
     PFN_vkCreateAccelerationStructureKHR vkCreateAccelerationStructureKHR = nullptr;
     PFN_vkDestroyAccelerationStructureKHR vkDestroyAccelerationStructureKHR = nullptr;
     PFN_vkGetAccelerationStructureBuildSizesKHR vkGetAccelerationStructureBuildSizesKHR = nullptr;
@@ -33,7 +42,7 @@ public:
 private:
     void CreateInstance();
     void SetupDebugMessenger();
-    void CreateSurface(HWND hwnd, HINSTANCE hinstance);
+    void CreateSurface(const Window& window);
     void PickPhysicalDevice();
     void CreateLogicalDevice();
     void CreateCommandPool();

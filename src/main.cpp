@@ -2,81 +2,81 @@
 #include "Core/Window.hpp"
 #include "Scene/Camera.hpp"
 #include "Scene/GltfLoader.hpp"
+#include "UI/EditorUI.hpp"
+#include "Vulkan/PathTracer.hpp"
 #include "Vulkan/VulkanContext.hpp"
 #include "Vulkan/VulkanSwapchain.hpp"
-#include "Vulkan/PathTracer.hpp"
-#include "UI/EditorUI.hpp"
 
 #include <filesystem>
 
-int main(int argc, char* argv[]) {
-    std::string modelPath = "assets/models/pbr.glb";
-    std::string testOutput;
+namespace {
+
+constexpr uint32_t kInitialWidth = 1280;
+constexpr uint32_t kInitialHeight = 720;
+constexpr const char* kDefaultModel = "assets/models/pbr.glb";
+
+struct Options {
+    std::string modelPath = kDefaultModel;
+    // Headless-ish smoke test: render this many samples, write a PNG, exit.
+    std::string testOutputPath;
     uint32_t testSPP = 0;
+};
 
+Options ParseArguments(int argc, char* argv[]) {
+    Options options;
     for (int i = 1; i < argc; ++i) {
-        std::string arg = argv[i];
-        if (arg == "--test-render" && i + 2 < argc) {
-            testOutput = argv[i + 1];
-            testSPP = static_cast<uint32_t>(std::stoi(argv[i + 2]));
+        std::string argument = argv[i];
+        if (argument == "--test-render" && i + 2 < argc) {
+            options.testOutputPath = argv[i + 1];
+            options.testSPP = static_cast<uint32_t>(std::stoul(argv[i + 2]));
             i += 2;
-        } else if (arg[0] != '-') {
-            modelPath = arg;
+        } else if (!argument.starts_with("-")) {
+            options.modelPath = argument;
         }
     }
+    return options;
+}
 
-    if (!std::filesystem::exists(modelPath)) {
-        if (std::filesystem::exists("assets/models/conf_room.glb")) {
-            modelPath = "assets/models/conf_room.glb";
-        }
-    }
+bool IsGltfFile(const std::filesystem::path& path) {
+    std::string extension = path.extension().string();
+    std::transform(extension.begin(), extension.end(), extension.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return extension == ".gltf" || extension == ".glb";
+}
 
-    std::cout << "====================================================" << std::endl;
-    std::cout << "  SlimRender: Minimal Vulkan Path Tracer (C++20)   " << std::endl;
-    std::cout << "  Model: " << modelPath << std::endl;
-    std::cout << "  Controls:" << std::endl;
-    std::cout << "    - Right Mouse Drag : Rotate View (Yaw/Pitch)" << std::endl;
-    std::cout << "    - Middle Mouse Drag / Shift+Right Drag : Pan" << std::endl;
-    std::cout << "    - Mouse Wheel      : Zoom / Dolly" << std::endl;
-    std::cout << "    - W / A / S / D    : Move Camera" << std::endl;
-    std::cout << "    - Q / E            : Move Down / Up" << std::endl;
-    std::cout << "    - Shift / Ctrl     : Faster / Slower Move" << std::endl;
-    std::cout << "    - F1               : Toggle UI Overlay" << std::endl;
-    std::cout << "    - ESC              : Exit" << std::endl;
-    std::cout << "====================================================" << std::endl;
+void PrintBanner(const std::string& modelPath) {
+    std::cout << "====================================================\n"
+              << "  SlimRender: Minimal Vulkan Path Tracer (C++20)\n"
+              << "  Model: " << modelPath << "\n"
+              << "  Right drag: orbit | Middle drag: pan | Wheel: dolly\n"
+              << "  WASD + Q/E: fly | Shift/Ctrl: faster/slower\n"
+              << "  W/E/R: gizmo mode | F1: toggle UI | ESC: exit\n"
+              << "  Drag a .gltf/.glb onto the window to load it\n"
+              << "====================================================" << std::endl;
+}
+
+} // namespace
+
+int main(int argc, char* argv[]) {
+    Options options = ParseArguments(argc, argv);
+    PrintBanner(options.modelPath);
 
     try {
-        const uint32_t width = 1280;
-        const uint32_t height = 720;
-
-        SlimRender::Window window(width, height, "SlimRender - Blender Style Path Tracer");
+        SlimRender::Window window(kInitialWidth, kInitialHeight, "SlimRender");
         SlimRender::VulkanContext context(window);
-        SlimRender::VulkanSwapchain swapchain(context, width, height);
+        SlimRender::VulkanSwapchain swapchain(context, kInitialWidth, kInitialHeight);
 
-        std::cout << "[SlimRender] Loading glTF scene: " << modelPath << "..." << std::endl;
-        auto scene = std::make_unique<SlimRender::GltfScene>(context, modelPath);
+        auto scene = std::make_unique<SlimRender::GltfScene>(context, options.modelPath);
+        auto pathTracer = std::make_unique<SlimRender::PathTracer>(
+            context, *scene, kInitialWidth, kInitialHeight);
 
         SlimRender::Camera camera;
-        auto frameCamera = [&camera](const SlimRender::GltfScene& s) {
-            if (s.HasCamera()) {
-                camera.SetPosition(s.GetCameraPosition());
-                camera.SetTarget(s.GetCameraTarget());
-            } else {
-                glm::vec3 sceneCenter = s.GetSceneCenter();
-                float sceneRadius = std::max(s.GetSceneRadius(), 1.0f);
-                camera.SetPosition(sceneCenter + glm::vec3(0.0f, sceneRadius * 0.4f, sceneRadius * 1.6f));
-                camera.SetTarget(sceneCenter);
-            }
-        };
-        frameCamera(*scene);
+        FrameCameraToScene(camera, *scene);
 
-        std::cout << "[SlimRender] Initializing Path Tracer..." << std::endl;
-        auto pathTracer = std::make_unique<SlimRender::PathTracer>(context, *scene, width, height);
-
-        std::cout << "[SlimRender] Initializing Blender Style Editor UI..." << std::endl;
         SlimRender::EditorUI editorUI(context, window, swapchain);
 
-        // Command Buffers for frames in flight
+        // One command buffer per frame in flight, so the CPU can record frame N+1 while
+        // the GPU is still executing frame N.
         std::array<VkCommandBuffer, SlimRender::VulkanSwapchain::MAX_FRAMES_IN_FLIGHT> commandBuffers{};
         VkCommandBufferAllocateInfo allocInfo{};
         allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
@@ -85,98 +85,84 @@ int main(int argc, char* argv[]) {
         allocInfo.commandBufferCount = static_cast<uint32_t>(commandBuffers.size());
         VK_CHECK(vkAllocateCommandBuffers(context.GetDevice(), &allocInfo, commandBuffers.data()));
 
+        auto resizeToWindow = [&] {
+            uint32_t width = window.GetWidth();
+            uint32_t height = window.GetHeight();
+            if (width > 0 && height > 0) {
+                swapchain.Recreate(width, height);
+                pathTracer->OnResize(width, height);
+            }
+        };
+
+        // Swapping the scene tears down everything that references it, but keeps the
+        // lighting the user has dialled in.
+        auto loadScene = [&](const std::string& path) {
+            std::filesystem::path filePath(path);
+            if (!IsGltfFile(filePath)) {
+                editorUI.ShowNotification("Only .gltf / .glb are supported: " + filePath.filename().string(), 4.0f);
+                return;
+            }
+
+            try {
+                vkDeviceWaitIdle(context.GetDevice());
+                auto newScene = std::make_unique<SlimRender::GltfScene>(context, path);
+                auto newPathTracer = std::make_unique<SlimRender::PathTracer>(
+                    context, *newScene, window.GetWidth(), window.GetHeight());
+
+                newPathTracer->SetSunDirection(pathTracer->GetSunDirection());
+                newPathTracer->SetSunIntensity(pathTracer->GetSunIntensity());
+                newPathTracer->SetSunColor(pathTracer->GetSunColor());
+                newPathTracer->SetSkyIntensity(pathTracer->GetSkyIntensity());
+                newPathTracer->SetMaxBounces(pathTracer->GetMaxBounces());
+
+                scene = std::move(newScene);
+                pathTracer = std::move(newPathTracer);
+
+                FrameCameraToScene(camera, *scene);
+                editorUI.SetSelectedObjectIndex(scene->GetObjects().empty() ? -1 : 0);
+                editorUI.ShowNotification("Loaded: " + filePath.filename().string());
+            } catch (const std::exception& error) {
+                std::cerr << "[SlimRender] Failed to load scene: " << error.what() << std::endl;
+                editorUI.ShowNotification("Load failed: " + std::string(error.what()), 5.0f);
+            }
+        };
+
         uint32_t currentFrame = 0;
         auto lastTime = std::chrono::high_resolution_clock::now();
-        int frameCounter = 0;
-        double fpsTimer = 0.0;
 
         while (!window.ShouldClose()) {
             window.PollEvents();
 
-            auto currentTime = std::chrono::high_resolution_clock::now();
-            float dt = std::chrono::duration<float, std::chrono::seconds::period>(currentTime - lastTime).count();
-            lastTime = currentTime;
+            auto now = std::chrono::high_resolution_clock::now();
+            float deltaTime = std::chrono::duration<float>(now - lastTime).count();
+            lastTime = now;
 
-            if (window.IsKeyDown(VK_ESCAPE)) {
-                break;
-            }
-
-            // Handle file drag-and-drop or File->Open request
-            std::string loadPath;
             if (window.HasDroppedFile()) {
-                loadPath = window.GetDroppedFile();
+                loadScene(window.TakeDroppedFile());
             } else if (editorUI.HasPendingLoadFile()) {
-                loadPath = editorUI.GetPendingLoadFile();
-            }
-
-            if (!loadPath.empty()) {
-                std::filesystem::path p(loadPath);
-                std::string ext = p.extension().string();
-                for (char& c : ext) c = static_cast<char>(std::tolower(c));
-                if (ext == ".gltf" || ext == ".glb") {
-                    try {
-                        std::cout << "[SlimRender] Loading scene: " << loadPath << "..." << std::endl;
-                        vkDeviceWaitIdle(context.GetDevice());
-
-                        auto newScene = std::make_unique<SlimRender::GltfScene>(context, loadPath);
-                        auto newPathTracer = std::make_unique<SlimRender::PathTracer>(
-                            context, *newScene, window.GetWidth(), window.GetHeight());
-
-                        // Preserve lighting configuration
-                        newPathTracer->SetSunDirection(pathTracer->GetSunDirection());
-                        newPathTracer->SetSunIntensity(pathTracer->GetSunIntensity());
-                        newPathTracer->SetSunColor(pathTracer->GetSunColor());
-                        newPathTracer->SetSkyIntensity(pathTracer->GetSkyIntensity());
-
-                        vkDeviceWaitIdle(context.GetDevice());
-
-                        scene = std::move(newScene);
-                        pathTracer = std::move(newPathTracer);
-
-                        // Frame camera to new scene (either embedded camera or scene bounds)
-                        frameCamera(*scene);
-
-                        editorUI.SetSelectedObjectIndex(scene->GetObjects().empty() ? -1 : 0);
-                        editorUI.ShowNotification("Loaded: " + p.filename().string());
-                        std::cout << "[SlimRender] Scene loaded successfully: " << loadPath << std::endl;
-                    } catch (const std::exception& e) {
-                        std::cerr << "[SlimRender] Failed to load scene: " << e.what() << std::endl;
-                        editorUI.ShowNotification("Load failed: " + std::string(e.what()), 5.0f);
-                    }
-                } else {
-                    editorUI.ShowNotification("Unsupported format (only .gltf/.glb): " + p.filename().string(), 4.0f);
-                }
+                loadScene(editorUI.TakePendingLoadFile());
             }
 
             if (window.IsResized()) {
-                uint32_t newW = window.GetWidth();
-                uint32_t newH = window.GetHeight();
-                if (newW > 0 && newH > 0) {
-                    swapchain.Recreate(newW, newH);
-                    pathTracer->OnResize(newW, newH);
-                }
+                resizeToWindow();
                 window.ResetResized();
             }
 
             float aspect = static_cast<float>(window.GetWidth()) / static_cast<float>(window.GetHeight());
 
-            // 1. Begin UI Frame and Draw
+            // The UI runs first: it may edit the scene, and it decides whether the camera
+            // is allowed to react to the mouse this frame.
             editorUI.BeginFrame();
-            editorUI.Draw(window, *scene, camera, *pathTracer, dt, aspect);
+            editorUI.Draw(window, *scene, camera, *pathTracer, deltaTime, aspect);
+            camera.Update(deltaTime, window);
 
-            // 2. Update Camera (respects UI/Gizmo input capture)
-            camera.Update(dt, window);
-
-            // 3. Acquire Swapchain Image
             uint32_t imageIndex = 0;
-            VkResult acquireRes = swapchain.AcquireNextImage(currentFrame, imageIndex);
-            if (acquireRes == VK_ERROR_OUT_OF_DATE_KHR) {
-                swapchain.Recreate(window.GetWidth(), window.GetHeight());
-                pathTracer->OnResize(window.GetWidth(), window.GetHeight());
+            if (swapchain.AcquireNextImage(currentFrame, imageIndex) == VK_ERROR_OUT_OF_DATE_KHR) {
+                editorUI.DiscardFrame(); // nothing will be submitted, so close the ImGui frame
+                resizeToWindow();
                 continue;
             }
 
-            // 4. Record Command Buffer
             VkCommandBuffer cmd = commandBuffers[currentFrame];
             vkResetCommandBuffer(cmd, 0);
 
@@ -185,68 +171,48 @@ int main(int argc, char* argv[]) {
             beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
             VK_CHECK(vkBeginCommandBuffer(cmd, &beginInfo));
 
-            // 4.1 Compute Path Tracing
-            pathTracer->RenderCompute(cmd, camera, aspect);
-
-            // 4.2 Blit compute result to Swapchain image (transitions to COLOR_ATTACHMENT_OPTIMAL)
-            pathTracer->BlitToSwapchain(cmd, swapchain, imageIndex);
-
-            // 4.3 Draw ImGui UI on top via Dynamic Rendering (transitions to PRESENT_SRC_KHR)
-            editorUI.EndFrameAndRender(cmd, swapchain, imageIndex);
+            pathTracer->RenderCompute(cmd, camera, aspect);            // trace one sample
+            pathTracer->BlitToSwapchain(cmd, swapchain, imageIndex);   // show it
+            editorUI.EndFrameAndRender(cmd, swapchain, imageIndex);    // draw the editor on top
 
             VK_CHECK(vkEndCommandBuffer(cmd));
 
-            // 5. Submit & Present
+            VkSemaphore waitSemaphore = swapchain.GetImageAvailableSemaphore(currentFrame);
+            VkSemaphore signalSemaphore = swapchain.GetRenderFinishedSemaphore(imageIndex);
+            // The first thing this command buffer does to the acquired image is blit
+            // into it, so that is the stage that has to wait for the acquire.
+            VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+
             VkSubmitInfo submitInfo{};
             submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-
-            VkSemaphore waitSemaphores[] = { swapchain.GetImageAvailableSemaphore(currentFrame) };
-            VkPipelineStageFlags waitStages[] = { VK_PIPELINE_STAGE_ALL_COMMANDS_BIT };
             submitInfo.waitSemaphoreCount = 1;
-            submitInfo.pWaitSemaphores = waitSemaphores;
-            submitInfo.pWaitDstStageMask = waitStages;
-
+            submitInfo.pWaitSemaphores = &waitSemaphore;
+            submitInfo.pWaitDstStageMask = &waitStage;
             submitInfo.commandBufferCount = 1;
             submitInfo.pCommandBuffers = &cmd;
-
-            VkSemaphore signalSemaphores[] = { swapchain.GetRenderFinishedSemaphore(imageIndex) };
             submitInfo.signalSemaphoreCount = 1;
-            submitInfo.pSignalSemaphores = signalSemaphores;
+            submitInfo.pSignalSemaphores = &signalSemaphore;
 
-            VK_CHECK(vkQueueSubmit(context.GetGraphicsQueue(), 1, &submitInfo, swapchain.GetInFlightFence(currentFrame)));
+            VK_CHECK(vkQueueSubmit(context.GetGraphicsQueue(), 1, &submitInfo,
+                                   swapchain.GetInFlightFence(currentFrame)));
 
-            VkResult presentRes = swapchain.Present(currentFrame, imageIndex);
-            if (presentRes == VK_ERROR_OUT_OF_DATE_KHR || presentRes == VK_SUBOPTIMAL_KHR) {
-                swapchain.Recreate(window.GetWidth(), window.GetHeight());
-                pathTracer->OnResize(window.GetWidth(), window.GetHeight());
-            }
-
-            if (testSPP > 0 && pathTracer->GetAccumulatedFrames() >= testSPP) {
-                std::cout << "[SlimRender] Test render finished with " << pathTracer->GetAccumulatedFrames()
-                          << " SPP. Saving to " << testOutput << "..." << std::endl;
-                pathTracer->SaveRenderToFile(testOutput);
-                break;
+            VkResult presentResult = swapchain.Present(imageIndex);
+            if (presentResult == VK_ERROR_OUT_OF_DATE_KHR || presentResult == VK_SUBOPTIMAL_KHR) {
+                resizeToWindow();
             }
 
             currentFrame = (currentFrame + 1) % SlimRender::VulkanSwapchain::MAX_FRAMES_IN_FLIGHT;
 
-            frameCounter++;
-            fpsTimer += dt;
-            if (fpsTimer >= 0.5) {
-                double fps = frameCounter / fpsTimer;
-                char titleBuf[256];
-                snprintf(titleBuf, sizeof(titleBuf), "SlimRender | SPP: %u | FPS: %.1f",
-                         pathTracer->GetAccumulatedFrames(), fps);
-                SetWindowTextA(window.GetHWND(), titleBuf);
-                frameCounter = 0;
-                fpsTimer = 0.0;
+            if (options.testSPP > 0 && pathTracer->GetAccumulatedFrames() >= options.testSPP) {
+                pathTracer->SaveRenderToFile(options.testOutputPath);
+                break;
             }
         }
 
-        vkDeviceWaitIdle(context.GetDevice());
-    } catch (const std::exception& e) {
-        std::cerr << "[SlimRender FATAL] " << e.what() << std::endl;
-        MessageBoxA(nullptr, e.what(), "SlimRender Error", MB_ICONERROR | MB_OK);
+        vkDeviceWaitIdle(context.GetDevice()); // let every frame finish before teardown
+    } catch (const std::exception& error) {
+        std::cerr << "[SlimRender FATAL] " << error.what() << std::endl;
+        MessageBoxA(nullptr, error.what(), "SlimRender Error", MB_ICONERROR | MB_OK);
         return 1;
     }
 

@@ -6,23 +6,25 @@
 
 namespace SlimRender {
 
+// Free-flying viewport camera: right mouse looks, middle mouse (or Shift+right) pans,
+// wheel dollies, WASD/QE flies. `target_` is only used to scale the pan speed with the
+// distance to whatever the camera was last framed on, the way a DCC viewport does.
 class Camera {
 public:
     Camera();
 
     void SetPosition(const glm::vec3& position);
     void SetTarget(const glm::vec3& target);
-    void SetPerspective(float fovYDegrees, float nearZ, float farZ);
 
-    void Update(float dt, Window& window);
+    void Update(float dt, const Window& window);
 
     glm::mat4 GetViewMatrix() const;
+    // Vulkan convention: clip space Y points down, so row 1 is negated.
     glm::mat4 GetProjectionMatrix(float aspect) const;
-    glm::mat4 GetStandardProjectionMatrix(float aspect) const;
-    glm::mat4 GetInvViewMatrix() const;
-    glm::mat4 GetInvProjectionMatrix(float aspect) const;
-    glm::vec3 GetPosition() const { return position_; }
+    // OpenGL convention (Y up), which is what ImGuizmo expects.
+    glm::mat4 GetGizmoProjectionMatrix(float aspect) const;
 
+    // The path tracer restarts its accumulation whenever the view changes.
     bool HasMoved() const { return hasMoved_; }
     void ResetMoved() { hasMoved_ = false; }
 
@@ -42,9 +44,6 @@ private:
     float fovY_ = 45.0f;
     float nearZ_ = 0.01f;
     float farZ_ = 1000.0f;
-
-    float moveSpeed_ = 5.0f;
-    float mouseSensitivity_ = 0.15f;
 
     bool hasMoved_ = true;
 };

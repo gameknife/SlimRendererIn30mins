@@ -5,14 +5,15 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-# Vulkan SDK
+# ---------------------------------------------------------------------------------------
+# Dependencies: only the Vulkan SDK has to be installed. GLM is fetched if it is missing,
+# and everything else is vendored in third_party/ as single headers or plain sources.
+# ---------------------------------------------------------------------------------------
 find_package(Vulkan REQUIRED)
-message(STATUS "Found Vulkan: ${Vulkan_INCLUDE_DIRS}")
 
-# GLM Math Library (Try find_package first, fallback to FetchContent)
 find_package(glm CONFIG QUIET)
 if(NOT TARGET glm::glm)
-    message(STATUS "GLM not found locally, fetching via FetchContent...")
+    message(STATUS "GLM not found locally, fetching it...")
     include(FetchContent)
     FetchContent_Declare(
         glm
@@ -23,27 +24,15 @@ if(NOT TARGET glm::glm)
     FetchContent_MakeAvailable(glm)
 endif()
 
-# Find glslc for shader compilation
 find_program(GLSLC_EXECUTABLE glslc HINTS "${Vulkan_GLSLC_EXECUTABLE}" "$ENV{VULKAN_SDK}/bin")
 if(NOT GLSLC_EXECUTABLE)
-    message(FATAL_ERROR "glslc not found! Please ensure Vulkan SDK bin is in PATH or VULKAN_SDK is set.")
+    message(FATAL_ERROR "glslc not found. Put the Vulkan SDK bin directory on PATH, or set VULKAN_SDK.")
 endif()
-message(STATUS "Using glslc: ${GLSLC_EXECUTABLE}")
 
-# Shader compilation target
-set(SHADER_SRC "${CMAKE_CURRENT_SOURCE_DIR}/assets/shaders/pathtrace.comp")
-set(SHADER_SPV "${CMAKE_CURRENT_SOURCE_DIR}/assets/shaders/pathtrace.comp.spv")
-
-add_custom_command(
-    OUTPUT "${SHADER_SPV}"
-    COMMAND ${GLSLC_EXECUTABLE} --target-env=vulkan1.3 -o "${SHADER_SPV}" "${SHADER_SRC}"
-    DEPENDS "${SHADER_SRC}"
-    COMMENT "Compiling ${SHADER_SRC} -> ${SHADER_SPV}"
-)
-add_custom_target(compile_shaders ALL DEPENDS "${SHADER_SPV}")
-
-# SlimRender sources
-set(SLIMRENDER_SOURCES
+# ---------------------------------------------------------------------------------------
+# Target
+# ---------------------------------------------------------------------------------------
+add_executable(SlimRender
     src/main.cpp
     src/Core/Common.hpp
     src/Core/Window.hpp
@@ -67,7 +56,7 @@ set(SLIMRENDER_SOURCES
     src/Vulkan/PathTracer.cpp
     src/UI/EditorUI.hpp
     src/UI/EditorUI.cpp
-    # Third party ImGui & ImGuizmo
+    # Vendored Dear ImGui and ImGuizmo
     third_party/imgui/imgui.cpp
     third_party/imgui/imgui_draw.cpp
     third_party/imgui/imgui_tables.cpp
@@ -77,18 +66,13 @@ set(SLIMRENDER_SOURCES
     third_party/ImGuizmo/ImGuizmo.cpp
 )
 
-add_executable(SlimRender ${SLIMRENDER_SOURCES})
-add_dependencies(SlimRender compile_shaders)
-
 target_include_directories(SlimRender PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
-    ${CMAKE_CURRENT_SOURCE_DIR}/third_party
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/cgltf
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/stb
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/imgui
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/imgui/backends
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ImGuizmo
-    ${Vulkan_INCLUDE_DIRS}
 )
 
 target_compile_definitions(SlimRender PRIVATE
@@ -99,20 +83,26 @@ target_compile_definitions(SlimRender PRIVATE
 target_link_libraries(SlimRender PRIVATE
     Vulkan::Vulkan
     glm::glm
-    shell32
-    comdlg32
+    shell32   # DragQueryFile, for drag-and-drop
+    comdlg32  # GetOpenFileName, for File > Open
 )
 
 if(MSVC)
-    target_compile_options(SlimRender PRIVATE /W3 /permissive- /utf-8)
-    # Enable Release optimizations
-    target_compile_options(SlimRender PRIVATE $<$<CONFIG:Release>:/O2 /Oi /Ot>)
+    target_compile_options(SlimRender PRIVATE /W3 /permissive- /utf-8 /MP)
 endif()
 
-# Post-build copy of assets to binary directory
+# ---------------------------------------------------------------------------------------
+# Assets. Both steps run after every link so the output directory always matches the
+# sources; compiling the shader is cheap enough not to bother tracking dependencies.
+# ---------------------------------------------------------------------------------------
+set(ASSET_DIR "$<TARGET_FILE_DIR:SlimRender>/assets")
+
 add_custom_command(TARGET SlimRender POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_directory
-    "${CMAKE_CURRENT_SOURCE_DIR}/assets"
-    "$<TARGET_FILE_DIR:SlimRender>/assets"
-    COMMENT "Copying assets to output directory..."
+            "${CMAKE_CURRENT_SOURCE_DIR}/assets" "${ASSET_DIR}"
+    COMMAND ${GLSLC_EXECUTABLE} --target-env=vulkan1.3 -O
+            -o "${ASSET_DIR}/shaders/pathtrace.comp.spv"
+            "${CMAKE_CURRENT_SOURCE_DIR}/assets/shaders/pathtrace.comp"
+    COMMENT "Copying assets and compiling shaders"
+    VERBATIM
 )
