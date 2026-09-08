@@ -12,7 +12,13 @@
 
 ---
 
-## 📸 渲染预览效果
+## 📸 编辑器与渲染预览
+
+### 🎨 Blender 风格 3D 交互视口编辑器
+![SlimRender Editor UI](docs/images/editor_ui.png)
+*(支持 3D 视口三轴 Gizmo 变换、大纲视图 Outliner、属性面板 Transform/Material/Render 实时调节与 SPP 累积进度指示)*
+
+### 🖼️ 物理真实感路径追踪样张
 
 | 室内复杂会议室场景 (`conf_room.glb`) | 户外游乐场场景 (`playground.glb`) |
 | :---: | :---: |
@@ -79,7 +85,7 @@ SlimRender/
 ├── CMakeLists.txt                      # 根目录 CMake 配置 (含 glslc 自动编译着色器)
 ├── .gitignore                          # 完善的构建与产物忽略规则
 ├── docs/
-│   └── images/                         # 示例渲染预览图 (conf_room, playground, pbr)
+│   └── images/                         # 预览截图 (editor_ui, conf_room, playground, pbr)
 ├── assets/
 │   ├── models/                         # 测试模型 (conf_room.glb, playground.glb, pbr.glb)
 │   └── shaders/
