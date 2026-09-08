@@ -1,0 +1,40 @@
+# Build directories
+build/
+bin/
+out/
+_deps/
+
+# IDE and Editor files
+.vs/
+.vscode/
+*.user
+*.suo
+*.sln.docstates
+*.userosscache
+*.sln.ide
+CMakeSettings.json
+CMakeUserPresets.json
+
+# Compiler and Linker artifacts
+*.obj
+*.pdb
+*.idb
+*.ilk
+*.lib
+*.exp
+*.exe
+*.dll
+
+# ImGui temporary configuration
+imgui.ini
+
+# Output renders and test artifacts
+renders/
+test_*.png
+*.log
+
+# OS-generated files
+Thumbs.db
+[Dd]esktop.ini
+.DS_Store
+
