@@ -1,17 +1,29 @@
 #version 460
-#extension GL_EXT_ray_query : enable
-#extension GL_EXT_buffer_reference : enable
-#extension GL_EXT_scalar_block_layout : enable
-#extension GL_EXT_shader_explicit_arithmetic_types_int64 : enable
-#extension GL_EXT_nonuniform_qualifier : enable
+
+// SlimRender path tracer.
+//
+// One invocation per pixel adds a single sample to a running average. Rays are traced
+// inline with GL_EXT_ray_query, so there is no ray tracing pipeline and no shader
+// binding table: this is an ordinary compute shader that happens to hit the BVH units.
+// All scene data arrives as 64-bit pointers in the push constants (buffer_reference),
+// which is why the descriptor set only holds the TLAS, two images and the textures.
+
+#extension GL_EXT_ray_query : require
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_nonuniform_qualifier : require
 
 layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 
 layout(set = 0, binding = 0) uniform accelerationStructureEXT topLevelAS;
-layout(set = 0, binding = 1, rgba32f) uniform image2D accumulationImage;
-layout(set = 0, binding = 2, rgba8) uniform image2D outputImage;
+layout(set = 0, binding = 1, rgba32f) uniform image2D accumulationImage; // running sum
+layout(set = 0, binding = 2, rgba8) uniform image2D outputImage;         // tonemapped copy
 layout(set = 0, binding = 3) uniform sampler2D textures[];
 
+// These four structs mirror src/Scene/SceneTypes.hpp exactly. `scalar` layout is what
+// makes that possible: members sit at their natural C offsets, with no std140/std430
+// padding rules to work around.
 struct Vertex {
     vec4 pos;    // xyz = position, w = uv.x
     vec4 normal; // xyz = normal,   w = uv.y
@@ -23,7 +35,6 @@ struct Material {
     float metallicFactor;
     float roughnessFactor;
     int baseColorTextureIndex;
-    int pad0;
 };
 
 struct InstanceData {
@@ -32,7 +43,6 @@ struct InstanceData {
     uint vertexOffset;
     uint indexOffset;
     uint materialIndex;
-    uint pad;
 };
 
 struct CameraUBO {
@@ -48,27 +58,26 @@ layout(buffer_reference, scalar) readonly buffer MaterialBuffer { Material mater
 layout(buffer_reference, scalar) readonly buffer InstanceBuffer { InstanceData instances[]; };
 
 layout(push_constant) uniform PushConstants {
+    vec4 sunDirectionAndIntensity; // xyz = direction towards the sun, w = intensity
+    vec4 sunColorAndSky;           // rgb = sun colour, a = sky intensity
     uint64_t cameraAddress;
     uint64_t vertexAddress;
     uint64_t indexAddress;
     uint64_t materialAddress;
     uint64_t instanceAddress;
-    uint64_t tlasHandle;
     uint frameIndex;
     uint maxBounces;
-    uint numSamples;
     uint width;
     uint height;
-    uint pad0;
-    uint pad1;
-    uint pad2;
-    vec4 sunDirectionAndIntensity;
-    vec4 sunColorAndSky;
 } pc;
 
 const float PI = 3.141592653589793;
+const float RAY_EPSILON = 0.001;  // pushes ray origins off the surface they start on
+const float RAY_MAX = 10000.0;
+const float DIELECTRIC_F0 = 0.04; // reflectance of a non-metal at normal incidence
 
-uint pcg_hash(inout uint seed) {
+// PCG hash: cheap, and decorrelated enough that neighbouring pixels do not share noise.
+uint pcgHash(inout uint seed) {
     uint state = seed * 747796405u + 2891336453u;
     uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
     seed = (word >> 22u) ^ word;
@@ -76,176 +85,201 @@ uint pcg_hash(inout uint seed) {
 }
 
 float rand(inout uint seed) {
-    return float(pcg_hash(seed)) / 4294967295.0;
+    return float(pcgHash(seed)) * (1.0 / 4294967296.0); // [0, 1)
 }
 
 vec2 rand2(inout uint seed) {
     return vec2(rand(seed), rand(seed));
 }
 
-vec3 ACESFilm(vec3 x) {
-    float a = 2.51;
-    float b = 0.03;
-    float c = 2.43;
-    float d = 0.59;
-    float e = 0.14;
-    return clamp((x * (a * x + b)) / (x * (c * x + d) + e), 0.0, 1.0);
+// Filmic curve that compresses HDR radiance into [0, 1] without clipping highlights.
+vec3 ACESFilm(vec3 color) {
+    const float a = 2.51, b = 0.03, c = 2.43, d = 0.59, e = 0.14;
+    return clamp((color * (a * color + b)) / (color * (c * color + d) + e), 0.0, 1.0);
+}
+
+// Analytic sky: a zenith-to-horizon gradient plus a small bright sun disc.
+vec3 SampleSky(vec3 direction, vec3 sunDirection, vec3 sunRadiance, float skyIntensity, bool includeSun) {
+    float height = clamp(direction.y * 0.5 + 0.5, 0.0, 1.0);
+    vec3 sky = mix(vec3(0.7, 0.82, 0.95), vec3(0.18, 0.38, 0.78), height) * skyIntensity;
+    if (includeSun) {
+        sky += sunRadiance * pow(max(dot(direction, sunDirection), 0.0), 128.0) * 4.0;
+    }
+    return sky;
+}
+
+// Builds an orthonormal basis around `normal` so local-space samples can be rotated into
+// world space with T * x + B * y + N * z.
+void BuildBasis(vec3 normal, out vec3 tangent, out vec3 bitangent) {
+    vec3 helper = abs(normal.z) < 0.999 ? vec3(0.0, 0.0, 1.0) : vec3(1.0, 0.0, 0.0);
+    tangent = normalize(cross(helper, normal));
+    bitangent = cross(normal, tangent);
+}
+
+bool TraceShadowRay(vec3 origin, vec3 direction) {
+    rayQueryEXT query;
+    // TerminateOnFirstHit: any occluder will do, the closest one is not needed.
+    rayQueryInitializeEXT(query, topLevelAS,
+                          gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT, 0xFF,
+                          origin, RAY_EPSILON, direction, RAY_MAX);
+    while (rayQueryProceedEXT(query)) {}
+    return rayQueryGetIntersectionTypeEXT(query, true) != gl_RayQueryCommittedIntersectionTriangleEXT;
 }
 
 void main() {
     ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
     if (pixel.x >= pc.width || pixel.y >= pc.height) {
-        return;
+        return; // the dispatch is rounded up to whole workgroups
     }
 
     uint seed = (pixel.y * pc.width + pixel.x) ^ (pc.frameIndex * 1999999973u);
 
+    // Jitter inside the pixel so that averaging the frames also antialiases the edges.
+    // The very first frame stays centred, which keeps the initial preview crisp.
+    vec2 jitter = pc.frameIndex == 0 ? vec2(0.5) : rand2(seed);
+    vec2 ndc = ((vec2(pixel) + jitter) / vec2(pc.width, pc.height)) * 2.0 - 1.0;
+
     CameraUBO cam = CameraBuffer(pc.cameraAddress).camera;
-
-    // Sub-pixel jitter for anti-aliasing
-    vec2 jitter = (pc.frameIndex == 0) ? vec2(0.5) : rand2(seed);
-    vec2 uv = (vec2(pixel) + jitter) / vec2(pc.width, pc.height);
-    vec2 ndc = uv * 2.0 - 1.0;
-
-    vec4 target = cam.invProj * vec4(ndc.x, ndc.y, 1.0, 1.0);
+    vec4 viewTarget = cam.invProj * vec4(ndc, 1.0, 1.0);
     vec3 rayOrigin = cam.cameraPos.xyz;
-    vec3 rayDir = normalize((cam.invView * vec4(normalize(target.xyz / target.w), 0.0)).xyz);
-
-    vec3 radiance = vec3(0.0);
-    vec3 throughput = vec3(1.0);
+    vec3 rayDir = normalize((cam.invView * vec4(normalize(viewTarget.xyz / viewTarget.w), 0.0)).xyz);
 
     vec3 sunDir = normalize(pc.sunDirectionAndIntensity.xyz);
-    vec3 sunColor = pc.sunColorAndSky.rgb * pc.sunDirectionAndIntensity.w;
-    float skyIntensity = pc.sunColorAndSky.w;
+    vec3 sunRadiance = pc.sunColorAndSky.rgb * pc.sunDirectionAndIntensity.w;
+    float skyIntensity = pc.sunColorAndSky.a;
+
+    vec3 radiance = vec3(0.0);   // light gathered along this path
+    vec3 throughput = vec3(1.0); // how much of it still reaches the camera
+
+    // The sun is sampled explicitly at every diffuse hit (next-event estimation), so a
+    // diffuse bounce that happens to fly into the sun disc would count it a second time.
+    // Only the camera ray and specular bounces are allowed to see the disc.
+    bool cameraOrSpecularRay = true;
 
     for (uint bounce = 0; bounce < pc.maxBounces; ++bounce) {
-        rayQueryEXT q;
-        rayQueryInitializeEXT(q, topLevelAS, gl_RayFlagsOpaqueEXT, 0xFF,
-                              rayOrigin, 0.001, rayDir, 10000.0);
-        while (rayQueryProceedEXT(q)) {}
+        rayQueryEXT query;
+        rayQueryInitializeEXT(query, topLevelAS, gl_RayFlagsOpaqueEXT, 0xFF,
+                              rayOrigin, RAY_EPSILON, rayDir, RAY_MAX);
+        while (rayQueryProceedEXT(query)) {} // opaque geometry only, so this never iterates
 
-        if (rayQueryGetIntersectionTypeEXT(q, true) != gl_RayQueryCommittedIntersectionTriangleEXT) {
-            // Missed geometry -> sample physical sky
-            float sunDot = max(dot(rayDir, sunDir), 0.0);
-            vec3 skyGradient = mix(vec3(0.7, 0.82, 0.95), vec3(0.18, 0.38, 0.78), clamp(rayDir.y * 0.5 + 0.5, 0.0, 1.0)) * skyIntensity;
-            vec3 sunDisc = sunColor * pow(sunDot, 128.0) * 4.0;
-            radiance += throughput * (skyGradient + sunDisc);
+        if (rayQueryGetIntersectionTypeEXT(query, true) != gl_RayQueryCommittedIntersectionTriangleEXT) {
+            radiance += throughput * SampleSky(rayDir, sunDir, sunRadiance, skyIntensity, cameraOrSpecularRay);
             break;
         }
 
-        // Triangle Hit
-        uint instCustomIdx = rayQueryGetIntersectionInstanceCustomIndexEXT(q, true);
-        uint primIdx = rayQueryGetIntersectionPrimitiveIndexEXT(q, true);
-        vec2 bary = rayQueryGetIntersectionBarycentricsEXT(q, true);
-        vec3 baryCoord = vec3(1.0 - bary.x - bary.y, bary.x, bary.y);
+        // --- Reconstruct the hit ------------------------------------------------------
+        // Ray query hands back indices and barycentrics; the vertex data is fetched by
+        // address, exactly as a closest-hit shader would.
+        uint instanceIndex = rayQueryGetIntersectionInstanceCustomIndexEXT(query, true);
+        uint primitiveIndex = rayQueryGetIntersectionPrimitiveIndexEXT(query, true);
+        vec2 barycentrics = rayQueryGetIntersectionBarycentricsEXT(query, true);
+        vec3 weights = vec3(1.0 - barycentrics.x - barycentrics.y, barycentrics.x, barycentrics.y);
 
-        InstanceData inst = InstanceBuffer(pc.instanceAddress).instances[instCustomIdx];
+        InstanceData inst = InstanceBuffer(pc.instanceAddress).instances[instanceIndex];
+        IndexBuffer indexBuffer = IndexBuffer(pc.indexAddress);
+        VertexBuffer vertexBuffer = VertexBuffer(pc.vertexAddress);
 
-        uint i0 = IndexBuffer(pc.indexAddress).indices[inst.indexOffset + primIdx * 3 + 0];
-        uint i1 = IndexBuffer(pc.indexAddress).indices[inst.indexOffset + primIdx * 3 + 1];
-        uint i2 = IndexBuffer(pc.indexAddress).indices[inst.indexOffset + primIdx * 3 + 2];
+        uint triangle = inst.indexOffset + primitiveIndex * 3;
+        Vertex v0 = vertexBuffer.vertices[inst.vertexOffset + indexBuffer.indices[triangle + 0]];
+        Vertex v1 = vertexBuffer.vertices[inst.vertexOffset + indexBuffer.indices[triangle + 1]];
+        Vertex v2 = vertexBuffer.vertices[inst.vertexOffset + indexBuffer.indices[triangle + 2]];
 
-        Vertex v0 = VertexBuffer(pc.vertexAddress).vertices[inst.vertexOffset + i0];
-        Vertex v1 = VertexBuffer(pc.vertexAddress).vertices[inst.vertexOffset + i1];
-        Vertex v2 = VertexBuffer(pc.vertexAddress).vertices[inst.vertexOffset + i2];
+        vec3 localPos = v0.pos.xyz * weights.x + v1.pos.xyz * weights.y + v2.pos.xyz * weights.z;
+        vec3 localNormal = v0.normal.xyz * weights.x + v1.normal.xyz * weights.y + v2.normal.xyz * weights.z;
+        vec2 uv = vec2(v0.pos.w, v0.normal.w) * weights.x +
+                  vec2(v1.pos.w, v1.normal.w) * weights.y +
+                  vec2(v2.pos.w, v2.normal.w) * weights.z;
 
-        vec3 objPos = v0.pos.xyz * baryCoord.x + v1.pos.xyz * baryCoord.y + v2.pos.xyz * baryCoord.z;
-        vec3 objNorm = v0.normal.xyz * baryCoord.x + v1.normal.xyz * baryCoord.y + v2.normal.xyz * baryCoord.z;
-        vec2 hitUV = vec2(v0.pos.w, v0.normal.w) * baryCoord.x +
-                     vec2(v1.pos.w, v1.normal.w) * baryCoord.y +
-                     vec2(v2.pos.w, v2.normal.w) * baryCoord.z;
-
-        vec3 worldPos = (inst.transform * vec4(objPos, 1.0)).xyz;
-        vec3 worldNorm = normalize(transpose(mat3(inst.invTransform)) * objNorm);
-
-        // Face normal towards ray
-        if (dot(worldNorm, -rayDir) < 0.0) {
-            worldNorm = -worldNorm;
+        vec3 worldPos = (inst.transform * vec4(localPos, 1.0)).xyz;
+        // Normals transform by the inverse transpose, or non-uniform scaling shears them.
+        vec3 normal = normalize(transpose(mat3(inst.invTransform)) * localNormal);
+        if (dot(normal, rayDir) > 0.0) {
+            normal = -normal; // geometry is double sided; always shade the side we hit
         }
 
+        // --- Material -----------------------------------------------------------------
         Material mat = MaterialBuffer(pc.materialAddress).materials[inst.materialIndex];
         vec4 baseColor = mat.baseColorFactor;
         if (mat.baseColorTextureIndex >= 0) {
-            baseColor *= texture(textures[nonuniformEXT(mat.baseColorTextureIndex)], hitUV);
+            baseColor *= texture(textures[nonuniformEXT(mat.baseColorTextureIndex)], uv);
         }
-
-        // Emissive light
-        radiance += throughput * mat.emissiveFactor.rgb;
-
-        // Next-Event Estimation (Direct Sun Light Shadow Ray)
-        float NdotL = max(dot(worldNorm, sunDir), 0.0);
-        if (NdotL > 0.0) {
-            rayQueryEXT shadowQ;
-            rayQueryInitializeEXT(shadowQ, topLevelAS, gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT, 0xFF,
-                                  worldPos + worldNorm * 0.001, 0.001, sunDir, 10000.0);
-            while (rayQueryProceedEXT(shadowQ)) {}
-
-            if (rayQueryGetIntersectionTypeEXT(shadowQ, true) != gl_RayQueryCommittedIntersectionTriangleEXT) {
-                radiance += throughput * (baseColor.rgb / PI) * NdotL * sunColor;
-            }
-        }
-
-        // Scatter for next bounce
-        vec3 N = worldNorm;
-        vec3 up = abs(N.z) < 0.999 ? vec3(0.0, 0.0, 1.0) : vec3(1.0, 0.0, 0.0);
-        vec3 T = normalize(cross(up, N));
-        vec3 B = cross(N, T);
 
         float metallic = clamp(mat.metallicFactor, 0.0, 1.0);
         float roughness = clamp(mat.roughnessFactor, 0.04, 1.0);
+        // Metals have no diffuse lobe: their base colour tints the reflection instead.
+        vec3 diffuseAlbedo = baseColor.rgb * (1.0 - metallic);
 
-        // Specular lobe vs Diffuse lobe selection
-        float specProb = mix(0.04, 1.0, metallic);
-        if (rand(seed) < specProb) {
-            // GGX Specular bounce
+        radiance += throughput * mat.emissiveFactor.rgb;
+
+        // --- Direct light: one shadow ray towards the sun ------------------------------
+        float NdotL = max(dot(normal, sunDir), 0.0);
+        if (NdotL > 0.0 && TraceShadowRay(worldPos + normal * RAY_EPSILON, sunDir)) {
+            // Lambert BRDF (albedo / PI) times the sun irradiance.
+            radiance += throughput * (diffuseAlbedo / PI) * NdotL * sunRadiance;
+        }
+
+        // --- Indirect light: pick one lobe and follow it -------------------------------
+        // Choosing between the lobes with probability `specularProbability` and dividing
+        // the weight by that probability keeps the estimator unbiased.
+        vec3 tangent, bitangent;
+        BuildBasis(normal, tangent, bitangent);
+
+        float specularProbability = mix(DIELECTRIC_F0, 1.0, metallic);
+        if (rand(seed) < specularProbability) {
+            // GGX: importance sample a microfacet normal, then reflect about it.
             vec2 r = rand2(seed);
-            float a = roughness * roughness;
+            float alpha = roughness * roughness;
             float phi = 2.0 * PI * r.x;
-            float cosThetaH = sqrt((1.0 - r.y) / (1.0 + (a * a - 1.0) * r.y));
-            float sinThetaH = sqrt(max(0.0, 1.0 - cosThetaH * cosThetaH));
-            vec3 H_local = vec3(sinThetaH * cos(phi), sinThetaH * sin(phi), cosThetaH);
-            vec3 H = normalize(T * H_local.x + B * H_local.y + N * H_local.z);
+            float cosTheta = sqrt((1.0 - r.y) / (1.0 + (alpha * alpha - 1.0) * r.y));
+            float sinTheta = sqrt(max(0.0, 1.0 - cosTheta * cosTheta));
+            vec3 halfVector = normalize(tangent * (sinTheta * cos(phi)) +
+                                        bitangent * (sinTheta * sin(phi)) +
+                                        normal * cosTheta);
 
-            vec3 V = -rayDir;
-            rayDir = reflect(-V, H);
+            rayDir = reflect(rayDir, halfVector);
+            // Fresnel at normal incidence divided by the selection probability: white for
+            // dielectrics, the base colour for metals. The masking-shadowing term is
+            // approximated as 1, which is where this stops being a reference renderer.
             throughput *= mix(vec3(1.0), baseColor.rgb, metallic);
+            cameraOrSpecularRay = true;
         } else {
-            // Cosine-weighted Diffuse bounce
+            // Cosine-weighted hemisphere sampling: the cosine in the rendering equation
+            // and the pdf cancel, leaving just the albedo.
             vec2 r = rand2(seed);
             float phi = 2.0 * PI * r.x;
             float cosTheta = sqrt(r.y);
             float sinTheta = sqrt(max(0.0, 1.0 - r.y));
-            vec3 localDir = vec3(sinTheta * cos(phi), sinTheta * sin(phi), cosTheta);
-            rayDir = normalize(T * localDir.x + B * localDir.y + N * localDir.z);
-            throughput *= baseColor.rgb;
+            rayDir = normalize(tangent * (sinTheta * cos(phi)) +
+                               bitangent * (sinTheta * sin(phi)) +
+                               normal * cosTheta);
+
+            throughput *= diffuseAlbedo / (1.0 - specularProbability);
+            cameraOrSpecularRay = false;
         }
 
-        rayOrigin = worldPos + worldNorm * 0.001;
+        rayOrigin = worldPos + normal * RAY_EPSILON;
 
-        // Russian Roulette path termination
+        // --- Russian roulette ----------------------------------------------------------
+        // Kill dim paths at random and scale the survivors up, so the average is
+        // unchanged but the expensive deep bounces are only paid for when they matter.
         if (bounce >= 2) {
-            float p = max(throughput.r, max(throughput.g, throughput.b));
-            if (p < 0.001 || rand(seed) > p) {
+            float survivalChance = max(throughput.r, max(throughput.g, throughput.b));
+            if (survivalChance < 0.001 || rand(seed) > survivalChance) {
                 break;
             }
-            throughput /= p;
+            throughput /= survivalChance;
         }
     }
 
-    // Accumulate radiance across frames
-    vec4 prevAccum = imageLoad(accumulationImage, pixel);
-    vec3 accumColor;
-    if (pc.frameIndex == 0) {
-        accumColor = radiance;
-    } else {
-        accumColor = prevAccum.rgb + radiance;
+    // Accumulate. frameIndex 0 starts a new average, which is how camera or material
+    // edits discard everything gathered so far.
+    vec3 accumulated = radiance;
+    if (pc.frameIndex > 0) {
+        accumulated += imageLoad(accumulationImage, pixel).rgb;
     }
-    imageStore(accumulationImage, pixel, vec4(accumColor, 1.0));
+    imageStore(accumulationImage, pixel, vec4(accumulated, 1.0));
 
-    // Tonemap and write to 8-bit output image
-    vec3 avgColor = accumColor / float(pc.frameIndex + 1);
-    vec3 ldrColor = ACESFilm(avgColor);
-    ldrColor = pow(ldrColor, vec3(1.0 / 2.2)); // Gamma correction
-
-    imageStore(outputImage, pixel, vec4(ldrColor, 1.0));
+    vec3 color = ACESFilm(accumulated / float(pc.frameIndex + 1));
+    color = pow(color, vec3(1.0 / 2.2)); // the swapchain is UNORM, so encode sRGB here
+    imageStore(outputImage, pixel, vec4(color, 1.0));
 }

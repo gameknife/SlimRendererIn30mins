@@ -17,6 +17,7 @@ VulkanBuffer::VulkanBuffer(
 
     VK_CHECK(vkCreateBuffer(context_->GetDevice(), &bufferInfo, nullptr, &buffer_));
 
+    // The buffer is only a description; memory is allocated and bound separately.
     VkMemoryRequirements memRequirements;
     vkGetBufferMemoryRequirements(context_->GetDevice(), buffer_, &memRequirements);
 
@@ -25,10 +26,11 @@ VulkanBuffer::VulkanBuffer(
     allocInfo.allocationSize = memRequirements.size;
     allocInfo.memoryTypeIndex = context_->FindMemoryType(memRequirements.memoryTypeBits, properties);
 
+    // Taking a device address later requires opting in at allocation time.
     VkMemoryAllocateFlagsInfo flagsInfo{};
+    flagsInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO;
+    flagsInfo.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
     if (usage & VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT) {
-        flagsInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO;
-        flagsInfo.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
         allocInfo.pNext = &flagsInfo;
     }
 
@@ -37,49 +39,9 @@ VulkanBuffer::VulkanBuffer(
 }
 
 VulkanBuffer::~VulkanBuffer() {
-    if (mapped_) {
-        Unmap();
-    }
-    if (buffer_ != VK_NULL_HANDLE) {
-        vkDestroyBuffer(context_->GetDevice(), buffer_, nullptr);
-        buffer_ = VK_NULL_HANDLE;
-    }
-    if (memory_ != VK_NULL_HANDLE) {
-        vkFreeMemory(context_->GetDevice(), memory_, nullptr);
-        memory_ = VK_NULL_HANDLE;
-    }
-}
-
-VulkanBuffer::VulkanBuffer(VulkanBuffer&& other) noexcept
-    : context_(other.context_),
-      buffer_(other.buffer_),
-      memory_(other.memory_),
-      size_(other.size_),
-      mapped_(other.mapped_) {
-    other.buffer_ = VK_NULL_HANDLE;
-    other.memory_ = VK_NULL_HANDLE;
-    other.mapped_ = nullptr;
-    other.size_ = 0;
-}
-
-VulkanBuffer& VulkanBuffer::operator=(VulkanBuffer&& other) noexcept {
-    if (this != &other) {
-        if (mapped_) Unmap();
-        if (buffer_ != VK_NULL_HANDLE) vkDestroyBuffer(context_->GetDevice(), buffer_, nullptr);
-        if (memory_ != VK_NULL_HANDLE) vkFreeMemory(context_->GetDevice(), memory_, nullptr);
-
-        context_ = other.context_;
-        buffer_ = other.buffer_;
-        memory_ = other.memory_;
-        size_ = other.size_;
-        mapped_ = other.mapped_;
-
-        other.buffer_ = VK_NULL_HANDLE;
-        other.memory_ = VK_NULL_HANDLE;
-        other.mapped_ = nullptr;
-        other.size_ = 0;
-    }
-    return *this;
+    Unmap();
+    vkDestroyBuffer(context_->GetDevice(), buffer_, nullptr);
+    vkFreeMemory(context_->GetDevice(), memory_, nullptr);
 }
 
 VkDeviceAddress VulkanBuffer::GetDeviceAddress() const {
@@ -89,9 +51,9 @@ VkDeviceAddress VulkanBuffer::GetDeviceAddress() const {
     return vkGetBufferDeviceAddress(context_->GetDevice(), &info);
 }
 
-void* VulkanBuffer::Map(VkDeviceSize offset, VkDeviceSize size) {
+void* VulkanBuffer::Map() {
     if (!mapped_) {
-        VK_CHECK(vkMapMemory(context_->GetDevice(), memory_, offset, size, 0, &mapped_));
+        VK_CHECK(vkMapMemory(context_->GetDevice(), memory_, 0, size_, 0, &mapped_));
     }
     return mapped_;
 }
@@ -103,9 +65,8 @@ void VulkanBuffer::Unmap() {
     }
 }
 
-void VulkanBuffer::Upload(const void* data, VkDeviceSize size, VkDeviceSize offset) {
-    void* ptr = Map(offset, size);
-    std::memcpy(ptr, data, static_cast<size_t>(size));
+void VulkanBuffer::Upload(const void* data, VkDeviceSize size) {
+    std::memcpy(Map(), data, static_cast<size_t>(size));
     Unmap();
 }
 
@@ -115,31 +76,26 @@ std::unique_ptr<VulkanBuffer> VulkanBuffer::CreateDeviceLocal(
     VkDeviceSize size,
     VkBufferUsageFlags additionalUsage) {
 
-    // Staging buffer
+    // Host-visible staging copy, which the CPU can write to directly...
     VulkanBuffer staging(
         context,
         size,
         VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT
-    );
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
     staging.Upload(data, size);
 
-    // Device local buffer
+    // ...and the VRAM-resident copy the GPU actually reads from.
     auto deviceBuffer = std::make_unique<VulkanBuffer>(
         context,
         size,
         VK_BUFFER_USAGE_TRANSFER_DST_BIT | additionalUsage,
-        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT
-    );
+        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
 
-    // Transfer via single-time command buffer
     VkCommandBuffer cmd = context.BeginSingleTimeCommands();
     VkBufferCopy copyRegion{};
-    copyRegion.srcOffset = 0;
-    copyRegion.dstOffset = 0;
     copyRegion.size = size;
     vkCmdCopyBuffer(cmd, staging.GetHandle(), deviceBuffer->GetHandle(), 1, &copyRegion);
-    context.EndSingleTimeCommands(cmd);
+    context.EndSingleTimeCommands(cmd); // waits, so `staging` may be destroyed on return
 
     return deviceBuffer;
 }

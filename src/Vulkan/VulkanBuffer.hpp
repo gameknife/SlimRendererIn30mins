@@ -5,6 +5,10 @@
 
 namespace SlimRender {
 
+// One VkBuffer with its own VkDeviceMemory allocation.
+//
+// A real engine sub-allocates from a few large blocks (see VulkanMemoryAllocator);
+// this renderer allocates per buffer, which is slower but keeps the ownership obvious.
 class VulkanBuffer {
 public:
     VulkanBuffer(
@@ -16,18 +20,17 @@ public:
 
     VulkanBuffer(const VulkanBuffer&) = delete;
     VulkanBuffer& operator=(const VulkanBuffer&) = delete;
-    VulkanBuffer(VulkanBuffer&& other) noexcept;
-    VulkanBuffer& operator=(VulkanBuffer&& other) noexcept;
 
     VkBuffer GetHandle() const { return buffer_; }
-    VkDeviceMemory GetMemory() const { return memory_; }
-    VkDeviceSize GetSize() const { return size_; }
+    // The 64-bit pointer the shader dereferences; requires SHADER_DEVICE_ADDRESS usage.
     VkDeviceAddress GetDeviceAddress() const;
 
-    void* Map(VkDeviceSize offset = 0, VkDeviceSize size = VK_WHOLE_SIZE);
+    void* Map();
     void Unmap();
-    void Upload(const void* data, VkDeviceSize size, VkDeviceSize offset = 0);
+    void Upload(const void* data, VkDeviceSize size);
 
+    // Uploads through a staging buffer into device-local (VRAM) memory, which is where
+    // geometry the GPU reads every ray belongs.
     static std::unique_ptr<VulkanBuffer> CreateDeviceLocal(
         const VulkanContext& context,
         const void* data,

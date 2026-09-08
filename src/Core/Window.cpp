@@ -1,16 +1,15 @@
 #include "Core/Window.hpp"
-#include <windowsx.h>
-#include <shellapi.h>
+
 #include <imgui.h>
+#include <shellapi.h>
+#include <windowsx.h>
 
-#pragma comment(lib, "shell32.lib")
-
-// Forward declare message handler from imgui_impl_win32.cpp in global namespace
+// Declared here rather than included: imgui_impl_win32.h would pull in the whole backend.
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
 namespace SlimRender {
 
-static const wchar_t* WINDOW_CLASS_NAME = L"SlimRenderWindowClass";
+constexpr const wchar_t* kWindowClassName = L"SlimRenderWindowClass";
 
 Window::Window(uint32_t width, uint32_t height, const std::string& title)
     : width_(width), height_(height) {
@@ -22,19 +21,17 @@ Window::Window(uint32_t width, uint32_t height, const std::string& title)
     wc.lpfnWndProc = WndProc;
     wc.hInstance = hinstance_;
     wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
-    wc.lpszClassName = WINDOW_CLASS_NAME;
+    wc.lpszClassName = kWindowClassName;
 
     RegisterClassExW(&wc);
 
     RECT wr = { 0, 0, static_cast<LONG>(width), static_cast<LONG>(height) };
     AdjustWindowRect(&wr, WS_OVERLAPPEDWINDOW, FALSE);
 
-    std::wstring wtitle(title.begin(), title.end());
-
     hwnd_ = CreateWindowExW(
         0,
-        WINDOW_CLASS_NAME,
-        wtitle.c_str(),
+        kWindowClassName,
+        Utf8ToWide(title).c_str(),
         WS_OVERLAPPEDWINDOW,
         CW_USEDEFAULT, CW_USEDEFAULT,
         wr.right - wr.left, wr.bottom - wr.top,
@@ -50,17 +47,10 @@ Window::Window(uint32_t width, uint32_t height, const std::string& title)
     ShowWindow(hwnd_, SW_SHOW);
     UpdateWindow(hwnd_);
 
-    // Allow drag-drop even if elevated (UIPI)
-    typedef BOOL(WINAPI* PFN_ChangeWindowMessageFilter)(UINT, DWORD);
-    HMODULE user32 = GetModuleHandleW(L"user32.dll");
-    if (user32) {
-        PFN_ChangeWindowMessageFilter pChangeWindowMessageFilter =
-            reinterpret_cast<PFN_ChangeWindowMessageFilter>(GetProcAddress(user32, "ChangeWindowMessageFilter"));
-        if (pChangeWindowMessageFilter) {
-            pChangeWindowMessageFilter(WM_DROPFILES, 1 /* MSGFLT_ADD */);
-            pChangeWindowMessageFilter(WM_COPYDATA, 1 /* MSGFLT_ADD */);
-            pChangeWindowMessageFilter(0x0049 /* WM_COPYGLOBALDATA */, 1 /* MSGFLT_ADD */);
-        }
+    // Explorer runs unelevated: without lifting the UIPI filter, a drop onto an
+    // elevated SlimRender window would be silently discarded.
+    for (UINT dropMessage : { UINT(WM_DROPFILES), UINT(WM_COPYDATA), UINT(0x0049 /* WM_COPYGLOBALDATA */) }) {
+        ChangeWindowMessageFilterEx(hwnd_, dropMessage, MSGFLT_ALLOW, nullptr);
     }
 
     DragAcceptFiles(hwnd_, TRUE);
@@ -71,7 +61,7 @@ Window::~Window() {
         DestroyWindow(hwnd_);
         hwnd_ = nullptr;
     }
-    UnregisterClassW(WINDOW_CLASS_NAME, hinstance_);
+    UnregisterClassW(kWindowClassName, hinstance_);
 }
 
 void Window::PollEvents() {
@@ -100,18 +90,10 @@ bool Window::IsMouseButtonDown(int button) const {
     return false;
 }
 
-void Window::GetMouseDelta(float& dx, float& dy) {
-    dx = mouseDeltaX_;
-    dy = mouseDeltaY_;
-}
-
-float Window::GetMouseWheelDelta() {
-    return mouseWheelDelta_;
-}
-
 LRESULT CALLBACK Window::WndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
+    // ImGui gets first look: while the cursor is over a panel the UI owns the event.
     if (::ImGui_ImplWin32_WndProcHandler(hwnd, msg, wparam, lparam)) {
-        return true;
+        return 1;
     }
 
     Window* window = nullptr;
@@ -146,21 +128,16 @@ LRESULT CALLBACK Window::WndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpar
     }
 
     case WM_DROPFILES: {
-        HDROP hDrop = reinterpret_cast<HDROP>(wparam);
-        UINT charCount = DragQueryFileW(hDrop, 0, nullptr, 0);
+        HDROP drop = reinterpret_cast<HDROP>(wparam);
+        UINT charCount = DragQueryFileW(drop, 0, nullptr, 0); // excludes the null terminator
         if (charCount > 0) {
-            std::vector<wchar_t> buffer(charCount + 1);
-            if (DragQueryFileW(hDrop, 0, buffer.data(), charCount + 1)) {
-                int sizeNeeded = WideCharToMultiByte(CP_UTF8, 0, buffer.data(), -1, nullptr, 0, nullptr, nullptr);
-                if (sizeNeeded > 1) {
-                    std::string filePath(sizeNeeded - 1, '\0');
-                    WideCharToMultiByte(CP_UTF8, 0, buffer.data(), -1, filePath.data(), sizeNeeded, nullptr, nullptr);
-                    window->droppedFile_ = filePath;
-                    window->hasDroppedFile_ = true;
-                }
+            std::vector<wchar_t> path(charCount + 1);
+            if (DragQueryFileW(drop, 0, path.data(), charCount + 1)) {
+                window->droppedFile_ = WideToUtf8(path.data());
+                window->hasDroppedFile_ = !window->droppedFile_.empty();
             }
         }
-        DragFinish(hDrop);
+        DragFinish(drop);
         return 0;
     }
 
